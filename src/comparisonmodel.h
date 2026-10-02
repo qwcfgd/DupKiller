@@ -9,6 +9,7 @@ class ComparisonModel final : public QAbstractItemModel {
 public:
     enum Column { OriginalName, OriginalDirectory, OriginalSize, OriginalModified, OriginalType,
                   CandidateName, CandidateDirectory, Replacement, CandidateSize, CandidateModified, CandidateType, ColumnCount };
+    enum class DisplayMode { Root, Directories, Files };
     explicit ComparisonModel(FileTreeModel *source, QObject *parent = nullptr);
     QModelIndex index(int row, int column, const QModelIndex &parent = {}) const override;
     QModelIndex parent(const QModelIndex &index) const override;
@@ -23,11 +24,15 @@ public:
     QModelIndex sourceIndex(const QModelIndex &index, bool original) const;
     QVector<QPair<QString, int>> keeperChoices(const QModelIndex &index) const;
     int pairCount() const { return pairs; }
+    void setDisplayMode(DisplayMode mode);
+    DisplayMode displayMode() const { return display; }
 private:
     struct Node {
         Node *parent = nullptr;
         int row = 0, group = -1, candidate = -1;
         QString candidatePath, originalPath;
+        QString name, originalDirectory, candidateDirectory, originalParent, candidateParent;
+        QString type, sizeText, modifiedText, originalModifiedText;
         quint64 size = 0;
         QDateTime modified, originalModified;
         std::vector<std::unique_ptr<Node>> children;
@@ -39,11 +44,14 @@ private:
     int sortColumn = CandidateName;
     Qt::SortOrder sortOrder = Qt::AscendingOrder;
     QVector<int> keepers;
+    QVector<int> keeperCounts;
+    QVector<QVector<Node *>> groupPairs;
+    DisplayMode display = DisplayMode::Files;
     int pairs = 0;
     Node *node(const QModelIndex &index) const;
     QModelIndex forNode(Node *node, int column = 0) const;
     void rebuild();
-    void refreshPlan();
+    void refreshPlan(const QVector<int> &groups);
     void sortNode(Node *node);
     void describeFolders(Node *node, const QString &originalRoot);
 };

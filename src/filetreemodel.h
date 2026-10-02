@@ -2,6 +2,7 @@
 #include "domain.h"
 #include <QAbstractItemModel>
 #include <QSet>
+#include <QHash>
 #include <memory>
 #include <vector>
 
@@ -26,14 +27,17 @@ public:
     const ScanResult &result() const { return scan; }
     QVector<Operation> plan() const;
     quint64 saving() const;
+    int operationCount() const { return selectedCount; }
     QModelIndex indexForFile(int group, int file) const;
     QModelIndex indexForPath(const QString &path) const;
     QString chooseSelected(const QModelIndexList &selected);
     void applyRule(const QModelIndexList &selected, KeepRule rule);
     void preferFolders(const QModelIndexList &selected);
     void setReplacement(const QModelIndexList &selected, bool enabled);
+    void resetDefaults();
 signals:
     void planChanged();
+    void groupsChanged(const QVector<int> &groups);
 private:
     struct Node {
         QString name, path;
@@ -47,11 +51,18 @@ private:
     std::unique_ptr<Node> root;
     ScanResult scan;
     QVector<QVector<Node *>> groupNodes;
+    QHash<QString, Node *> pathNodes;
+    QVector<quint64> groupSavings;
+    QVector<int> groupCounts;
+    quint64 selectedBytes = 0;
+    int selectedCount = 0;
     int sortColumn = Name;
     Qt::SortOrder sortOrder = Qt::AscendingOrder;
     Node *node(const QModelIndex &index) const;
     QModelIndex forNode(Node *node, int column = 0) const;
     void notifyGroup(int group);
+    void notifyChanges(const QSet<int> &groups);
+    void updateTotals(int group);
     QSet<int> selectedGroups(const QModelIndexList &selected) const;
     void collect(Node *node, QSet<int> &groups) const;
     void sortNode(Node *node);

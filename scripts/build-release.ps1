@@ -27,7 +27,14 @@ try {
             if ($LASTEXITCODE -ne 0) { throw "windeployqt failed: $taskPreset" }
             # These local Qt builds do not include MinGW runtime DLLs in their bin folders.
             foreach ($taskLibrary in @('libgcc_s_seh-1.dll','libstdc++-6.dll','libwinpthread-1.dll')) {
-                Copy-Item -LiteralPath (Join-Path $taskCompiler $taskLibrary) -Destination $taskOutput -Force
+                $taskRuntimeSource = Join-Path $taskCompiler $taskLibrary
+                $taskRuntimeDestination = Join-Path $taskOutput $taskLibrary
+                # An unchanged runtime may be loaded by a running task. Avoid reopening it for writing.
+                if (-not (Test-Path -LiteralPath $taskRuntimeDestination) -or
+                    (Get-FileHash -LiteralPath $taskRuntimeSource -Algorithm SHA256).Hash -ne
+                    (Get-FileHash -LiteralPath $taskRuntimeDestination -Algorithm SHA256).Hash) {
+                    Copy-Item -LiteralPath $taskRuntimeSource -Destination $taskRuntimeDestination -Force
+                }
             }
             Copy-Item -LiteralPath (Join-Path $taskProjectRoot 'README.md') -Destination $taskOutput -Force
             Copy-Item -LiteralPath (Join-Path $taskProjectRoot 'LICENSE') -Destination $taskOutput -Force

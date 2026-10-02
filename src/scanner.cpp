@@ -2,6 +2,7 @@
 #include "windowsfs.h"
 #include <QDir>
 #include <QFileInfo>
+#include <QElapsedTimer>
 #include <QMap>
 #include <QSet>
 #include <QThreadPool>
@@ -117,17 +118,32 @@ QString volumeFor(const QString &root) {
     return v.size() == 3 && v[1] == ':' ? v : QString();
 }
 void message(ScanResult &r, const QString &m) { if (r.messages.size() < 250) r.messages.append(m); }
-void addFile(const QString &path, const QString &root, const QString &side, QVector<FileRecord> &files, ScanResult &result, const Progress &progress) {
+void addFile(const QString &path, const QString &root, const QString &side, QVector<FileRecord> &files, ScanResult &result, const Progress &progress, const WIN32_FIND_DATAW *discovered = nullptr) {
     ++result.enumerated;
     FileRecord f; QString error;
-    if (win::inspect(path, root, side, f, error)) files.append(f);
-    else { ++result.skipped; message(result, path + "：" + error); }
+    const QString name = discovered ? QString::fromWCharArray(discovered->cFileName) : QFileInfo(path).fileName();
+    if (name.endsWith(".lnk", Qt::CaseInsensitive) || name.startsWith(".dupkiller-") || (result.options.photosOnly && !photoName(name))) ++result.skipped;
+    else if (discovered) {
+        constexpr DWORD excluded = FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_OFFLINE | 0x00040000 | 0x00400000;
+        if (discovered->dwFileAttributes & excluded) ++result.skipped;
+        else {
+            // Directory enumeration already supplies name and size. Open only buckets that could match.
+            f.path = path; f.root = root; f.side = side; f.name = name;
+            f.size = (quint64(discovered->nFileSizeHigh) << 32) | discovered->nFileSizeLow;
+            files.append(f);
+        }
+    } else {
+        ++result.inspected;
+        if (win::inspect(path, root, side, f, error)) files.append(f);
+        else { ++result.skipped; message(result, path + "：" + error); }
+    }
     if (progress && result.enumerated % 256 == 0) progress(QStringLiteral("枚举文件"), result.enumerated, 0);
 }
 void nativeEnumerate(const QString &root, const QString &side, QVector<FileRecord> &files, ScanResult &result, const Cancel &cancel, const Progress &progress) {
     QVector<QString> stack{root};
     while (!stack.isEmpty() && !cancelled(cancel)) {
         const QString dir = stack.takeLast();
+        (side == "A" ? result.foldersA : result.foldersB).append(dir);
         WIN32_FIND_DATAW data{};
         const auto pattern = win::nativePath(dir + "/*");
         HANDLE search = FindFirstFileExW(pattern.c_str(), FindExInfoBasic, &data, FindExSearchNameMatch, nullptr, FIND_FIRST_EX_LARGE_FETCH);
@@ -145,7 +161,7 @@ void nativeEnumerate(const QString &root, const QString &side, QVector<FileRecor
             if (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
                 if (!(data.dwFileAttributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_OFFLINE))) stack.append(path);
                 else ++result.skipped;
-            } else addFile(path, root, side, files, result, progress);
+            } else addFile(path, root, side, files, result, progress, &data);
         } while (FindNextFileW(search, &data));
         const DWORD error = GetLastError();
         FindClose(search);
@@ -173,7 +189,11 @@ bool indexedEnumerate(const Index &index, const QString &root, const QString &si
         return path;
     };
     for (auto it = index.entries.constBegin(); it != index.entries.constEnd() && !cancelled(cancel); ++it) {
-        if (it->attributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        if (it->attributes & FILE_ATTRIBUTE_DIRECTORY) {
+            const auto directory = resolve(it.key());
+            if (!directory.isEmpty()) (side == "A" ? result.foldersA : result.foldersB).append(directory);
+            continue;
+        }
         const QString parent = resolve(it->parent);
         if (!parent.isEmpty()) addFile(QDir(parent).filePath(it->name), root, side, files, result, progress);
     }
@@ -184,10 +204,14 @@ ScanResult Scanner::scan(ScanOptions options, const Cancel &cancel, const Progre
     ScanResult result;
     result.error = validateRoots(options); result.options = options;
     if (!result.error.isEmpty()) return result;
+    QElapsedTimer timer; timer.start();
+    const int recommended = qMin(win::recommendedHashWorkers(options.rootA), options.mode == Mode::Dual ? win::recommendedHashWorkers(options.rootB) : 4);
+    result.hashWorkers = options.hashWorkers > 0 ? qBound(1, options.hashWorkers, 4) : qMin(recommended, qMax(1, QThread::idealThreadCount()));
+    message(result, QStringLiteral("磁盘读取并发：%1；机械盘或无法确认的设备采用单路读取。").arg(result.hashWorkers));
     QVector<FileRecord> files;
     QHash<QString, Index> indexes;
     auto enumerate = [&](const QString &root, const QString &side) {
-        const QString volume = options.backend == Backend::Auto ? volumeFor(root) : QString();
+        const QString volume = options.backend == Backend::Auto && recommended > 1 ? volumeFor(root) : QString();
         if (!volume.isEmpty()) {
             if (!indexes.contains(volume)) indexes.insert(volume, buildIndex(volume, cancel, progress));
             const auto &index = indexes[volume];
@@ -203,6 +227,7 @@ ScanResult Scanner::scan(ScanOptions options, const Cancel &cancel, const Progre
     enumerate(options.rootA, "A");
     if (options.mode == Mode::Dual && !cancelled(cancel)) enumerate(options.rootB, "B");
     indexes.clear();
+    result.enumerateMs = timer.elapsed(); timer.restart();
     if (cancelled(cancel)) { result.cancelled = true; return result; }
     std::sort(files.begin(), files.end(), [](const auto &a, const auto &b) { return a.path < b.path; });
     QHash<QString, QMap<quint64, QVector<int>>> buckets;
@@ -216,25 +241,58 @@ ScanResult Scanner::scan(ScanOptions options, const Cancel &cancel, const Progre
         for (int i : indices) candidates.push_back(files[i]);
     }
     files.clear(); buckets.clear();
+    std::sort(candidates.begin(), candidates.end(), [](const auto &a, const auto &b) { return a.path < b.path; });
+    // A prefix is only a rejection filter. Every surviving match still receives full SHA-256 and stream checks.
+    QHash<QString, QVector<size_t>> sampledBuckets;
+    std::vector<FileRecord> filtered;
+    for (size_t i = 0; i < candidates.size() && !cancelled(cancel); ++i) {
+        auto &f = candidates[i]; QString error; bool ok = true;
+        if (!f.fileId) {
+            const auto expectedSize = f.size; ++result.inspected;
+            ok = win::inspect(f.path, f.root, f.side, f, error) && f.size == expectedSize;
+            if (!ok && error.isEmpty()) error = QStringLiteral("文件大小在枚举后变化。");
+        }
+        if (!ok) { ++result.skipped; message(result, f.path + "：" + error); continue; }
+        if (options.sampling && f.size > 128 * 1024) {
+            QByteArray digest; ++result.sampled;
+            if (!win::sampleFile(f, digest, cancel, error)) { ++result.skipped; message(result, f.path + "：" + error); continue; }
+            const QString key = f.name + QChar(0) + QString::number(f.size) + QChar(0) + QString::fromLatin1(digest.toHex());
+            sampledBuckets[key].append(i);
+        } else filtered.push_back(f);
+        if (progress && i % 64 == 0) progress(QStringLiteral("检查候选元数据及文件头"), i + 1, candidates.size());
+    }
+    for (const auto &indices : sampledBuckets) {
+        bool a = false, b = false;
+        for (size_t i : indices) { a |= candidates[i].side == "A"; b |= candidates[i].side == "B"; }
+        if (indices.size() < 2 || (options.mode == Mode::Dual && !(a && b))) { result.sampleRejected += indices.size(); continue; }
+        for (size_t i : indices) filtered.push_back(std::move(candidates[i]));
+    }
+    candidates = std::move(filtered); sampledBuckets.clear();
+    std::sort(candidates.begin(), candidates.end(), [](const auto &a, const auto &b) { return a.path < b.path; });
+    for (const auto &f : candidates) result.hashBytes += f.size;
+    result.sampleMs = timer.elapsed(); timer.restart();
+    if (cancelled(cancel)) { result.cancelled = true; return result; }
     struct Hashed { FileRecord file; QString error; bool ok = false; };
     std::vector<Hashed> hashed(candidates.size());
-    std::atomic_size_t next{0}, finished{0};
+    std::atomic_size_t next{0}; std::atomic<quint64> readBytes{0};
     QThreadPool pool;
-    pool.setMaxThreadCount(qMin(4, qMax(1, QThread::idealThreadCount())));
+    pool.setMaxThreadCount(result.hashWorkers);
     QVector<QFuture<void>> jobs;
-    if (progress) progress(QStringLiteral("计算候选文件 SHA-256"), 0, candidates.size());
+    if (progress) progress(QStringLiteral("SHA-256 数据读取（字节）"), 0, result.hashBytes);
     for (int worker = 0; worker < pool.maxThreadCount(); ++worker) jobs.append(QtConcurrent::run(&pool, [&] {
         for (;;) {
             if (cancelled(cancel)) break;
             const size_t i = next.fetch_add(1);
             if (i >= candidates.size()) break;
             auto &out = hashed[i]; out.file = candidates[i];
-            out.ok = win::hashFile(out.file, cancel, out.error);
-            const size_t done = finished.fetch_add(1) + 1;
-            if (progress && (done % 16 == 0 || done == candidates.size())) progress(QStringLiteral("计算候选文件 SHA-256"), done, candidates.size());
+            out.ok = win::hashFile(out.file, cancel, out.error, [&](quint64 bytes) {
+                const auto done = readBytes.fetch_add(bytes) + bytes;
+                if (progress) progress(QStringLiteral("SHA-256 数据读取（字节）"), done, result.hashBytes);
+            });
         }
     }));
     for (auto &job : jobs) job.waitForFinished();
+    result.hashMs = timer.elapsed();
     if (cancelled(cancel)) { result.cancelled = true; return result; }
     QMap<QString, DuplicateGroup> groups;
     for (const auto &item : hashed) {

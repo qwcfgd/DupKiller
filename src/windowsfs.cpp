@@ -6,6 +6,8 @@
 #include <shellapi.h>
 #include <shobjidl.h>
 #include <QTimeZone>
+#include <bcrypt.h>
+#include <winioctl.h>
 #include <cstring>
 
 namespace dup::win {
@@ -221,26 +223,56 @@ bool inspect(const QString &path, const QString &root, const QString &side, File
 bool unchanged(const FileRecord &a, const FileRecord &b) {
     return a.fileId == b.fileId && a.volumeId == b.volumeId && a.size == b.size && a.writeTicks == b.writeTicks && a.attributes == b.attributes;
 }
-bool hashHandle(HANDLE h, QByteArray &hash, const Cancel &cancel, QString &error) {
+int recommendedHashWorkers(const QString &root) {
+    wchar_t volume[MAX_PATH]{};
+    const auto path = QDir::toNativeSeparators(root).toStdWString();
+    if (!GetVolumePathNameW(path.c_str(), volume, MAX_PATH) || GetDriveTypeW(volume) != DRIVE_FIXED) return 1;
+    const QString v = QString::fromWCharArray(volume);
+    if (v.size() != 3 || v[1] != ':') return 1;
+    const auto device = (QStringLiteral("\\\\.\\") + v.left(2)).toStdWString();
+    Handle h(CreateFileW(device.c_str(), 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, 0, nullptr));
+    STORAGE_PROPERTY_QUERY query{}; query.PropertyId = StorageDeviceSeekPenaltyProperty; query.QueryType = PropertyStandardQuery;
+    DEVICE_SEEK_PENALTY_DESCRIPTOR descriptor{}; DWORD bytes = 0;
+    if (!h.valid() || !DeviceIoControl(h.value, IOCTL_STORAGE_QUERY_PROPERTY, &query, sizeof(query), &descriptor, sizeof(descriptor), &bytes, nullptr) ||
+        bytes < sizeof(descriptor) || descriptor.IncursSeekPenalty) return 1;
+    return 4;
+}
+bool sampleFile(const FileRecord &file, QByteArray &sample, const Cancel &cancel, QString &error) {
+    if (cancel && cancel->load()) { error = QStringLiteral("已取消。"); return false; }
+    Handle h(CreateFileW(nativePath(file.path).c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
+    FileRecord before, after;
+    if (!h.valid() || !metadata(h.value, before, error) || !unchanged(file, before)) { if (error.isEmpty()) error = QStringLiteral("文件在抽样前发生变化。"); return false; }
+    QByteArray bytes(int(qMin(quint64(65536), file.size)), Qt::Uninitialized); DWORD read = 0;
+    if (!ReadFile(h.value, bytes.data(), DWORD(bytes.size()), &read, nullptr) || read != DWORD(bytes.size())) { error = errorText(); return false; }
+    sample = QCryptographicHash::hash(bytes, QCryptographicHash::Sha256);
+    if (!metadata(h.value, after, error) || !unchanged(before, after)) { if (error.isEmpty()) error = QStringLiteral("文件在抽样期间发生变化。"); return false; }
+    return true;
+}
+bool hashHandle(HANDLE h, QByteArray &hash, const Cancel &cancel, QString &error, const ReadProgress &readProgress) {
     LARGE_INTEGER zero{};
     if (!SetFilePointerEx(h, zero, nullptr, FILE_BEGIN)) { error = errorText(); return false; }
-    QCryptographicHash digest(QCryptographicHash::Sha256);
-    QByteArray buffer(1024 * 1024, Qt::Uninitialized);
+    struct Provider {
+        BCRYPT_ALG_HANDLE handle = nullptr;
+        Provider() { BCryptOpenAlgorithmProvider(&handle, BCRYPT_SHA256_ALGORITHM, nullptr, 0); }
+        ~Provider() { if (handle) BCryptCloseAlgorithmProvider(handle, 0); }
+    };
+    static const Provider provider;
+    struct Digest { BCRYPT_HASH_HANDLE handle = nullptr; ~Digest() { if (handle) BCryptDestroyHash(handle); } } digest;
+    if (!provider.handle || BCryptCreateHash(provider.handle, &digest.handle, nullptr, 0, nullptr, 0, 0) < 0) { error = QStringLiteral("无法初始化 Windows SHA-256。"); return false; }
+    QByteArray buffer(4 * 1024 * 1024, Qt::Uninitialized);
     for (;;) {
         if (cancel && cancel->load()) { error = QStringLiteral("已取消。"); return false; }
         DWORD bytes = 0;
         if (!ReadFile(h, buffer.data(), DWORD(buffer.size()), &bytes, nullptr)) { error = errorText(); return false; }
         if (!bytes) break;
-#if QT_VERSION >= QT_VERSION_CHECK(6, 0, 0)
-        digest.addData(QByteArrayView(buffer.constData(), int(bytes)));
-#else
-        digest.addData(buffer.constData(), int(bytes));
-#endif
+        if (BCryptHashData(digest.handle, reinterpret_cast<PUCHAR>(buffer.data()), bytes, 0) < 0) { error = QStringLiteral("Windows SHA-256 计算失败。"); return false; }
+        if (readProgress) readProgress(bytes);
     }
-    hash = digest.result();
+    hash.resize(32);
+    if (BCryptFinishHash(digest.handle, reinterpret_cast<PUCHAR>(hash.data()), ULONG(hash.size()), 0) < 0) { hash.clear(); error = QStringLiteral("Windows SHA-256 完成失败。"); return false; }
     return true;
 }
-bool hashFile(FileRecord &f, const Cancel &cancel, QString &error) {
+bool hashFile(FileRecord &f, const Cancel &cancel, QString &error, const ReadProgress &readProgress) {
     std::vector<Handle> parents;
     if (!lockParents(f.path, parents, error)) return false;
     Handle h(CreateFileW(nativePath(f.path).c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
@@ -249,7 +281,7 @@ bool hashFile(FileRecord &f, const Cancel &cancel, QString &error) {
     FileRecord current;
     if (!metadata(h.value, current, error)) return false;
     if (!unchanged(f, current)) { error = QStringLiteral("文件在扫描期间发生变化。"); return false; }
-    if (!hashHandle(h.value, f.sha256, cancel, error)) return false;
+    if (!hashHandle(h.value, f.sha256, cancel, error, readProgress)) return false;
     if (!hashStreams(f.path, f.streams, cancel, error)) return false;
     FileRecord after;
     return metadata(h.value, after, error) && unchanged(current, after);
@@ -294,15 +326,25 @@ QString shortcutTarget(const QString &link, QString &error) {
     if (FAILED(hr)) { error = hrError(hr); return {}; }
     return cleanPath(QString::fromWCharArray(buffer));
 }
-bool recycleFile(const QString &path, QString &recycledPath, QByteArray &itemId, FileRecord &binMetadata, QString &error) {
+bool recycleFile(const QString &path, QString &recycledPath, QByteArray &itemId, FileRecord &binMetadata, QString &error, RecycleSession *session) {
     wchar_t volume[MAX_PATH]{};
     const auto p = QDir::toNativeSeparators(path).toStdWString();
     if (!GetVolumePathNameW(p.c_str(), volume, MAX_PATH) || GetDriveTypeW(volume) != DRIVE_FIXED) {
         error = QStringLiteral("该位置不支持本程序的安全回收站操作；请明确选择永久删除或跳过。"); return false;
     }
-    SHQUERYRBINFO bin{}; bin.cbSize = sizeof(bin);
-    const HRESULT query = SHQueryRecycleBinW(volume, &bin);
-    if (FAILED(query)) { error = QStringLiteral("回收站不可用，未永久删除：") + hrError(query); return false; }
+    // SHQueryRecycleBin enumerates totals. Repeating it for each copy makes large
+    // batches progressively slower. Cache only a successful preflight for this
+    // task and volume GUID; individual Shell callbacks still confirm recycling.
+    wchar_t volumeGuid[MAX_PATH]{};
+    const QString key = session && GetVolumeNameForVolumeMountPointW(volume, volumeGuid, MAX_PATH)
+        ? QString::fromWCharArray(volumeGuid).toCaseFolded() : QString();
+    if (!session || key.isEmpty() || !session->checkedVolumes.contains(key)) {
+        SHQUERYRBINFO bin{}; bin.cbSize = sizeof(bin);
+        if (session) ++session->queries;
+        const HRESULT query = SHQueryRecycleBinW(volume, &bin);
+        if (FAILED(query)) { error = QStringLiteral("回收站不可用，未永久删除：") + hrError(query); return false; }
+        if (session && !key.isEmpty()) session->checkedVolumes.insert(key);
+    }
     ComPtr<IFileOperation> operation;
     ComPtr<IShellItem> item;
     ComPtr<RecycleSink> sink; sink.p = new RecycleSink;

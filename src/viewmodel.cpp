@@ -4,6 +4,8 @@
 #include <QPointer>
 #include <QStandardPaths>
 #include <QtConcurrent/QtConcurrentRun>
+#include <QElapsedTimer>
+#include <mutex>
 
 namespace dup {
 ViewModel::ViewModel(QObject *parent) : QObject(parent), tree(this), scanWatcher(this), operationWatcher(this) {
@@ -35,8 +37,16 @@ void ViewModel::invalidate() {
 QString ViewModel::logsDirectory() const { return QStandardPaths::writableLocation(QStandardPaths::AppLocalDataLocation) + "/logs"; }
 Progress ViewModel::progressCallback() {
     const QPointer<ViewModel> self(this);
-    return [self](const QString &phase, quint64 completed, quint64 total) {
+    struct Updates { std::mutex mutex; QElapsedTimer clock; QString phase; quint64 completed = 0; Updates() { clock.start(); } };
+    const auto updates = std::make_shared<Updates>();
+    return [self, updates](const QString &phase, quint64 completed, quint64 total) {
         if (!self) return;
+        std::lock_guard<std::mutex> lock(updates->mutex);
+        if (phase == updates->phase) {
+            completed = qMax(completed, updates->completed);
+            if (updates->clock.elapsed() < 100 && (!total || completed < total)) return;
+        }
+        updates->phase = phase; updates->completed = completed; updates->clock.restart();
         QMetaObject::invokeMethod(self.data(), [self, phase, completed, total] { if (self) emit self->progressChanged(phase, completed, total); }, Qt::QueuedConnection);
     };
 }
@@ -63,7 +73,7 @@ void ViewModel::recover(const QString &journal) {
 void ViewModel::summarize() {
     const auto &r = tree.result();
     emit summaryChanged(QStringLiteral("%1 个重复组  ·  %2 份待替换  ·  副本大小 %3  ·  枚举 %4 / 哈希 %5 / 跳过 %6%7")
-        .arg(r.groups.size()).arg(tree.plan().size()).arg(readableSize(tree.saving())).arg(r.enumerated).arg(r.hashed).arg(r.skipped)
+        .arg(r.groups.size()).arg(tree.operationCount()).arg(readableSize(tree.saving())).arg(r.enumerated).arg(r.hashed).arg(r.skipped)
         .arg(stale && !r.groups.isEmpty() ? QStringLiteral("  ·  请重新扫描") : QString()));
 }
 }

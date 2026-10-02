@@ -85,13 +85,18 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent), vm(this) {
     listTitle->addWidget(permanent); editingControls << permanent; layout->addLayout(listTitle);
     auto *toolbar = new QHBoxLayout;
     auto *choose = new QPushButton(QStringLiteral("选中文件设为保留")); auto *prefer = new QPushButton(QStringLiteral("优先保留选中目录"));
-    rule = new QComboBox; rule->addItems({QStringLiteral("路径层级最浅"), QStringLiteral("修改时间最早"), QStringLiteral("修改时间最新")});
+    rule = new QComboBox; rule->setObjectName("keepRule"); rule->addItems({QStringLiteral("路径层级最浅"), QStringLiteral("修改时间最早"), QStringLiteral("修改时间最新"), QStringLiteral("优先替换日期说明目录")});
     auto *apply = new QPushButton(QStringLiteral("批量应用规则"));
+    auto *defaults = new QPushButton(QStringLiteral("默认")); defaults->setObjectName("resetDefaults"); defaults->setToolTip(QStringLiteral("所有组恢复最浅路径原件及副本替换勾选，关闭永久删除。"));
+    listTitle->insertWidget(1, defaults);
     toolbar->addWidget(choose); toolbar->addWidget(prefer); toolbar->addWidget(rule); toolbar->addWidget(apply); toolbar->addStretch();
+    displayMode = new QComboBox; displayMode->setObjectName("displayMode"); displayMode->addItems({QStringLiteral("根目录"), QStringLiteral("子目录"), QStringLiteral("文件")}); displayMode->setCurrentIndex(2);
+    displayMode->setToolTip(QStringLiteral("根目录：只显示固定根行；子目录：所有子目录；文件：按目录层级显示重复文件。显示方式不改变执行清单。"));
+    listTitle->insertWidget(2, new QLabel(QStringLiteral("显示"))); listTitle->insertWidget(3, displayMode);
     sortKey = new QComboBox; sortKey->addItems({QStringLiteral("文件名"), QStringLiteral("修改时间"), QStringLiteral("文件类型"), QStringLiteral("大小")});
     sortDirection = new QComboBox; sortDirection->addItems({QStringLiteral("升序 ↑"), QStringLiteral("降序 ↓")});
     toolbar->addWidget(new QLabel(QStringLiteral("排序"))); toolbar->addWidget(sortKey); toolbar->addWidget(sortDirection); layout->addLayout(toolbar);
-    editingControls << choose << prefer << rule << apply;
+    editingControls << defaults << choose << prefer << rule << apply << displayMode << sortKey << sortDirection;
     auto *help = new QLabel(QStringLiteral("左右同一行即同一组匹配。点击左侧原件可切换保留目标；Ctrl / Shift 多选后可批量处理。根目录行固定，SHA-256 仅悬停显示。"));
     help->setObjectName("muted"); layout->addWidget(help);
     auto *splitter = new QSplitter(Qt::Vertical);
@@ -99,6 +104,8 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent), vm(this) {
     splitter->addWidget(comparisonView);
     log = new QPlainTextEdit; log->setObjectName("operationLog"); log->setReadOnly(true); log->setMaximumBlockCount(1500); log->setPlaceholderText(QStringLiteral("扫描方式、跳过原因和执行日志将在此显示。")); splitter->addWidget(log);
     splitter->setSizes({450, 120}); layout->addWidget(splitter, 1);
+    connect(defaults, &QPushButton::clicked, this, [this] { permanent->setChecked(false); rule->setCurrentIndex(0); vm.model()->resetDefaults(); });
+    connect(displayMode, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int index) { comparison->setDisplayMode(static_cast<ComparisonModel::DisplayMode>(index)); });
     connect(choose, &QPushButton::clicked, this, [this] { const QString error = vm.model()->chooseSelected(selection()); if (!error.isEmpty()) QMessageBox::information(this, QStringLiteral("选择保留文件"), error); });
     connect(prefer, &QPushButton::clicked, this, [this] { vm.model()->preferFolders(selection()); });
     connect(apply, &QPushButton::clicked, this, [this] { vm.model()->applyRule(selection(), static_cast<KeepRule>(rule->currentIndex())); });
@@ -133,7 +140,7 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent), vm(this) {
     connect(executeButton, &QPushButton::clicked, this, [this] {
         const QString deletion = permanent->isChecked() ? QStringLiteral("永久删除副本，无法通过回收站撤销") : QStringLiteral("将副本送入回收站");
         const QString text = QStringLiteral("将替换 %1 份副本（%2），%3。\n原件将保留；每份副本会被同目录的“原文件名.lnk”替代。\n\n执行前会重新校验文件。确认执行？")
-            .arg(vm.model()->plan().size()).arg(readableSize(vm.model()->saving())).arg(deletion);
+            .arg(vm.model()->operationCount()).arg(readableSize(vm.model()->saving())).arg(deletion);
         if (QMessageBox::question(this, QStringLiteral("确认执行清单"), text, QMessageBox::Yes | QMessageBox::No, QMessageBox::No) == QMessageBox::Yes) vm.execute(permanent->isChecked());
     });
     connect(&vm, &ViewModel::message, log, &QPlainTextEdit::appendPlainText);

@@ -68,6 +68,7 @@ Qt::ItemFlags FileTreeModel::flags(const QModelIndex &i) const {
     auto result = Qt::ItemIsEnabled | Qt::ItemIsSelectable;
     const auto *n = node(i);
     if (!n->folder()) {
+        result |= Qt::ItemNeverHasChildren;
         const auto &g = scan.groups[n->group]; const auto &f = g.files[n->file];
         if (i.column() == Keep && (scan.options.mode == Mode::Single || f.side == "A")) result |= Qt::ItemIsUserCheckable;
         if (i.column() == Replace && n->file != g.keeper && (scan.options.mode == Mode::Single || f.side == "B")) result |= Qt::ItemIsUserCheckable;
@@ -82,17 +83,43 @@ bool FileTreeModel::setData(const QModelIndex &i, const QVariant &value, int rol
         setKeeper(g, scan.options.mode, n->file);
     } else if (i.column() == Replace) g.replace[n->file] = value.toInt() == Qt::Checked;
     else return false;
-    notifyGroup(n->group); emit planChanged(); return true;
+    notifyChanges({n->group}); return true;
 }
 void FileTreeModel::notifyGroup(int g) { for (auto *n : groupNodes[g]) emit dataChanged(forNode(n), forNode(n, ColumnCount - 1)); }
+void FileTreeModel::updateTotals(int g) {
+    selectedBytes -= groupSavings[g]; selectedCount -= groupCounts[g]; groupSavings[g] = 0; groupCounts[g] = 0;
+    const auto &group = scan.groups[g];
+    for (int f = 0; f < group.files.size(); ++f) if (group.replace[f]) { groupSavings[g] += group.files[f].size; ++groupCounts[g]; }
+    selectedBytes += groupSavings[g]; selectedCount += groupCounts[g];
+}
+void FileTreeModel::notifyChanges(const QSet<int> &groups) {
+    QVector<int> changed; changed.reserve(groups.size());
+    for (int g : groups) { updateTotals(g); notifyGroup(g); changed.append(g); }
+    emit groupsChanged(changed); emit planChanged();
+}
 void FileTreeModel::clear() { setResult({}); }
 void FileTreeModel::setResult(ScanResult result) {
-    beginResetModel(); scan = std::move(result); root = std::make_unique<Node>(); groupNodes.clear(); groupNodes.resize(scan.groups.size());
-    auto folder = [](Node *parent, const QString &name, const QString &path) {
-        for (auto &n : parent->children) if (n->folder() && n->path == path) return n.get();
+    beginResetModel(); scan = std::move(result); root = std::make_unique<Node>(); groupNodes.clear(); groupNodes.resize(scan.groups.size()); pathNodes.clear();
+    selectedCount = 0; selectedBytes = 0; groupSavings.fill(0, scan.groups.size()); groupCounts.fill(0, scan.groups.size());
+    auto folder = [this](Node *parent, const QString &name, const QString &path) {
+        const auto key = path.toCaseFolded(); const auto found = pathNodes.constFind(key);
+        if (found != pathNodes.constEnd()) return *found;
         auto n = std::make_unique<Node>(); n->name = name; n->path = path; n->parent = parent; n->row = int(parent->children.size());
-        auto *out = n.get(); parent->children.push_back(std::move(n)); return out;
+        auto *out = n.get(); parent->children.push_back(std::move(n)); pathNodes.insert(key, out); return out;
     };
+    auto addDirectories = [&](const QString &side, const QString &rootPath, const QStringList &directories) {
+        if (rootPath.isEmpty()) return;
+        auto *base = folder(root.get(), QStringLiteral("目录 %1  ·  ").arg(side) + QDir::toNativeSeparators(rootPath), rootPath);
+        for (const auto &path : directories) {
+            if (samePath(path, rootPath)) continue;
+            QString cumulative = rootPath; auto *p = base;
+            for (const auto &part : QDir(rootPath).relativeFilePath(path).split('/')) {
+                cumulative = QDir(cumulative).filePath(part); p = folder(p, part, cumulative);
+            }
+        }
+    };
+    addDirectories("A", scan.options.rootA, scan.foldersA);
+    if (scan.options.mode == Mode::Dual) addDirectories("B", scan.options.rootB, scan.foldersB);
     for (int g = 0; g < scan.groups.size(); ++g) for (int f = 0; f < scan.groups[g].files.size(); ++f) {
         const auto &file = scan.groups[g].files[f];
         Node *p = folder(root.get(), QStringLiteral("目录 %1  ·  ").arg(file.side) + QDir::toNativeSeparators(file.root), file.root);
@@ -102,12 +129,14 @@ void FileTreeModel::setResult(ScanResult result) {
         for (int j = 0; j + 1 < parts.size(); ++j) { cumulative = QDir(cumulative).filePath(parts[j]); p = folder(p, parts[j], cumulative); }
         auto n = std::make_unique<Node>(); n->name = file.name; n->path = file.path; n->parent = p; n->group = g; n->file = f;
         n->size = file.size; n->modified = file.modified; n->row = int(p->children.size());
-        groupNodes[g].append(n.get()); p->children.push_back(std::move(n));
+        groupNodes[g].append(n.get()); pathNodes.insert(file.path.toCaseFolded(), n.get()); p->children.push_back(std::move(n));
         for (Node *ancestor = p; ancestor; ancestor = ancestor->parent) { ancestor->size += file.size; if (ancestor->modified < file.modified) ancestor->modified = file.modified; }
     }
+    for (int g = 0; g < scan.groups.size(); ++g) updateTotals(g);
     sortNode(root.get()); endResetModel(); emit planChanged();
 }
 void FileTreeModel::sortNode(Node *p) {
+    if (p->children.empty()) return;
     QCollator collator; collator.setNumericMode(true); collator.setCaseSensitivity(Qt::CaseSensitive);
     std::stable_sort(p->children.begin(), p->children.end(), [&](const auto &a, const auto &b) {
         if (a->folder() != b->folder()) return a->folder();
@@ -138,19 +167,13 @@ QVector<Operation> FileTreeModel::plan() const {
     for (const auto &g : scan.groups) if (g.keeper >= 0) for (int i = 0; i < g.files.size(); ++i) if (g.replace[i]) result.append({g.files[i], g.files[g.keeper]});
     return result;
 }
-quint64 FileTreeModel::saving() const { quint64 bytes = 0; for (const auto &g : scan.groups) for (int i = 0; i < g.files.size(); ++i) if (g.replace[i]) bytes += g.files[i].size; return bytes; }
+quint64 FileTreeModel::saving() const { return selectedBytes; }
 QModelIndex FileTreeModel::indexForFile(int group, int file) const {
     if (group < 0 || group >= groupNodes.size()) return {};
-    for (auto *n : groupNodes[group]) if (n->file == file) return forNode(n);
-    return {};
+    return file < 0 || file >= groupNodes[group].size() ? QModelIndex() : forNode(groupNodes[group][file]);
 }
 QModelIndex FileTreeModel::indexForPath(const QString &path) const {
-    std::function<Node *(Node *)> find = [&](Node *n) -> Node * {
-        if (n != root.get() && samePath(n->path, path)) return n;
-        for (const auto &child : n->children) if (auto *match = find(child.get())) return match;
-        return nullptr;
-    };
-    return forNode(find(root.get()));
+    return forNode(pathNodes.value(cleanPath(path).toCaseFolded(), nullptr));
 }
 void FileTreeModel::collect(Node *n, QSet<int> &groups) const { if (!n->folder()) groups.insert(n->group); for (const auto &c : n->children) collect(c.get(), groups); }
 QSet<int> FileTreeModel::selectedGroups(const QModelIndexList &selected) const {
@@ -168,16 +191,19 @@ QString FileTreeModel::chooseSelected(const QModelIndexList &selected) {
         choices[n->group] = n->file;
     }
     if (choices.isEmpty()) return QStringLiteral("请选中一个或多个文件行；每个重复组选择一份。");
-    for (auto it = choices.constBegin(); it != choices.constEnd(); ++it) { setKeeper(scan.groups[it.key()], scan.options.mode, it.value()); notifyGroup(it.key()); }
-    emit planChanged(); return {};
+    QSet<int> touched;
+    for (auto it = choices.constBegin(); it != choices.constEnd(); ++it) { setKeeper(scan.groups[it.key()], scan.options.mode, it.value()); touched.insert(it.key()); }
+    notifyChanges(touched); return {};
 }
 void FileTreeModel::applyRule(const QModelIndexList &selected, KeepRule rule) {
-    for (int g : selectedGroups(selected)) { setKeeper(scan.groups[g], scan.options.mode, pickKeeper(scan.groups[g], scan.options.mode, rule)); notifyGroup(g); }
-    emit planChanged();
+    const auto groups = selectedGroups(selected);
+    for (int g : groups) setKeeper(scan.groups[g], scan.options.mode, pickKeeper(scan.groups[g], scan.options.mode, rule));
+    notifyChanges(groups);
 }
 void FileTreeModel::preferFolders(const QModelIndexList &selected) {
     QStringList folders;
     for (const auto &i : selected) if (node(i)->folder()) folders.append(node(i)->path);
+    QSet<int> touched;
     for (int g : selectedGroups(selected)) {
         DuplicateGroup candidates = scan.groups[g];
         QVector<int> mapping; candidates.files.clear();
@@ -187,9 +213,9 @@ void FileTreeModel::preferFolders(const QModelIndexList &selected) {
             if (match && (scan.options.mode == Mode::Single || file.side == "A")) { candidates.files.append(file); mapping.append(f); }
         }
         const int best = pickKeeper(candidates, scan.options.mode, KeepRule::Shallowest);
-        if (best >= 0) { setKeeper(scan.groups[g], scan.options.mode, mapping[best]); notifyGroup(g); }
+        if (best >= 0) { setKeeper(scan.groups[g], scan.options.mode, mapping[best]); touched.insert(g); }
     }
-    emit planChanged();
+    notifyChanges(touched);
 }
 void FileTreeModel::setReplacement(const QModelIndexList &selected, bool enabled) {
     QSet<int> touched;
@@ -201,7 +227,14 @@ void FileTreeModel::setReplacement(const QModelIndexList &selected, bool enabled
         for (const auto &c : n->children) visit(c.get());
     };
     for (const auto &i : selected) visit(node(i));
-    for (int g : touched) notifyGroup(g);
-    emit planChanged();
+    notifyChanges(touched);
+}
+void FileTreeModel::resetDefaults() {
+    QSet<int> touched;
+    for (int g = 0; g < scan.groups.size(); ++g) {
+        scan.groups[g].replace.clear();
+        setKeeper(scan.groups[g], scan.options.mode, pickKeeper(scan.groups[g], scan.options.mode, KeepRule::Shallowest)); touched.insert(g);
+    }
+    notifyChanges(touched);
 }
 }

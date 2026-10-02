@@ -21,7 +21,7 @@ add_library(dup_core STATIC
   src/domain.cpp src/domain.h src/windowsfs.cpp src/windowsfs.h
   src/scanner.cpp src/scanner.h src/executor.cpp src/executor.h)
 target_include_directories(dup_core PUBLIC src)
-target_link_libraries(dup_core PUBLIC ${QT}::Core ${QT}::Concurrent PRIVATE ole32 shell32 uuid)
+target_link_libraries(dup_core PUBLIC ${QT}::Core ${QT}::Concurrent PRIVATE ole32 shell32 uuid bcrypt)
 add_library(dup_ui STATIC
   src/comparisonmodel.cpp src/comparisonmodel.h src/comparisonview.cpp src/comparisonview.h
   src/filetreemodel.cpp src/filetreemodel.h src/viewmodel.cpp src/viewmodel.h
@@ -29,8 +29,12 @@ add_library(dup_ui STATIC
 target_link_libraries(dup_ui PUBLIC dup_core ${QT}::Widgets)
 add_executable(QtDupKiller WIN32 src/main.cpp resources/app.rc resources/icons.qrc)
 target_link_libraries(QtDupKiller PRIVATE dup_ui)
+add_executable(dup_task src/task.cpp)
+target_link_libraries(dup_task PRIVATE dup_core)
 include(CTest)
 if(BUILD_TESTING)
+  add_executable(dup_benchmark tests/benchmark_ui.cpp)
+  target_link_libraries(dup_benchmark PRIVATE dup_ui)
   add_executable(dup_fixture tests/fixture_ab.cpp)
   target_link_libraries(dup_fixture PRIVATE dup_ui)
   add_executable(dup_tests tests/test_dup.cpp resources/icons.qrc)

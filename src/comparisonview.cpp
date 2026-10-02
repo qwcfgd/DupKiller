@@ -109,8 +109,9 @@ bool ComparisonView::eventFilter(QObject *object, QEvent *event) {
 QModelIndexList ComparisonView::sourceSelection(bool candidates) const {
     const bool left = !candidates && selectingOriginal;
     QModelIndexList selected;
+    QSet<QModelIndex> seen;
     for (const auto &i : candidate->selectionModel()->selectedRows(left ? ComparisonModel::OriginalName : ComparisonModel::CandidateName)) {
-        const auto mapped = model->sourceIndex(i, left); if (mapped.isValid() && !selected.contains(mapped)) selected.append(mapped);
+        const auto mapped = model->sourceIndex(i, left); if (mapped.isValid() && !seen.contains(mapped)) { selected.append(mapped); seen.insert(mapped); }
     }
     return selected;
 }
@@ -129,9 +130,9 @@ void ComparisonView::setSort(int column, Qt::SortOrder order) {
     originalRoot->header()->setSortIndicator(originalColumn, order); candidateRoot->header()->setSortIndicator(candidateColumn, order); model->sort(column, order);
 }
 void ComparisonView::restoreTree() {
+    const QSignalBlocker a(original), b(candidate);
     const auto folder = model->index(0, 0); original->setRootIndex(folder); candidate->setRootIndex(folder);
-    if (model->pairCount() <= 1500) { original->expandAll(); candidate->expandAll(); }
-    else { original->expandToDepth(1); candidate->expandToDepth(1); }
+    original->expandAll(); candidate->expandAll();
     originalRoot->collapseAll(); candidateRoot->collapseAll();
     updateFrozenHeights();
 }

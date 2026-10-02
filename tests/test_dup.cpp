@@ -300,6 +300,29 @@ private slots:
         QVERIFY(!QFileInfo::exists(recycled)); const QString metadata = QFileInfo(recycled).absolutePath() + "/$I" + QFileInfo(recycled).fileName().mid(2);
         QVERIFY(!QFileInfo::exists(metadata));
     }
+    void recycleBatchChecksOncePerTask() {
+        QTemporaryDir dir(QDir::currentPath() + "/test-output/case-XXXXXX");
+        const auto original = createFile(dir.path(), "photo.jpg", "batch contents");
+        QStringList copies;
+        for (const auto &folder : {"a", "b", "c"}) copies.append(createFile(dir.path(), QString(folder) + "/photo.jpg", "batch contents"));
+        for (int task = 0; task < 2; ++task) {
+            FileTreeModel model; model.setResult(scan(dir.path())); QCOMPARE(model.plan().size(), 3);
+            const auto result = Executor::execute(model.plan(), model.result().options, false, dir.path() + "/logs", token());
+            QVERIFY2(result.done == 3 && result.failed == 0, qPrintable(result.messages.join('\n')));
+            QCOMPARE(result.recycleQueries, 1);
+            {
+                win::ComScope com; QString error;
+                for (const auto &copy : copies) {
+                    QVERIFY(!QFileInfo::exists(copy));
+                    QVERIFY(samePath(win::shortcutTarget(copy + ".lnk", error), original));
+                }
+            }
+            const auto restored = Executor::recover(result.logPath, token());
+            QVERIFY2(restored.done == 3 && restored.failed == 0, qPrintable(restored.messages.join('\n')));
+            for (const auto &copy : copies) { QCOMPARE(content(copy), QByteArray("batch contents")); QVERIFY(!QFileInfo::exists(copy + ".lnk")); }
+            QCOMPARE(content(original), QByteArray("batch contents"));
+        }
+    }
     void recoverInterruptedTransaction() {
         QTemporaryDir dir(QDir::currentPath() + "/test-output/case-XXXXXX"); createFile(dir.path(), "a.txt", "same"); const auto copy = createFile(dir.path(), "x/a.txt", "same");
         FileTreeModel model; model.setResult(scan(dir.path())); const auto op = model.plan()[0];
@@ -402,6 +425,80 @@ private slots:
         auto *splitter = window.findChild<QSplitter *>("comparisonSplitter"); QVERIFY(splitter); QVERIFY(splitter->handle(1)->isEnabled());
         const auto sizes = splitter->sizes(); splitter->setSizes({sizes[0] + 70, sizes[1] - 70}); QVERIFY(splitter->sizes()[0] > sizes[0]);
         const auto folder = pairs->index(0, 0, root); left->collapse(folder); QVERIFY(!right->isExpanded(folder)); right->expand(folder); QVERIFY(left->isExpanded(folder));
+    }
+    void samplingIsOnlyARejectionFilter() {
+        QTemporaryDir dir(QDir::currentPath() + "/test-output/case-XXXXXX");
+        QByteArray first(200000, 'a'), middle = first, head = first; middle[120000] = 'b'; head[0] = 'b';
+        createFile(dir.path(), "original/middle.jpg", first); createFile(dir.path(), "copy/middle.jpg", middle);
+        createFile(dir.path(), "original/head.jpg", first); createFile(dir.path(), "copy/head.jpg", head);
+        createFile(dir.path(), "original/same.jpg", first); createFile(dir.path(), "copy/same.jpg", first);
+        createFile(dir.path(), "original/not-photo.bin", first); createFile(dir.path(), "copy/not-photo.bin", first);
+        for (int i = 0; i < 50; ++i) createFile(dir.path(), QString("unique/%1.jpg").arg(i), "unique");
+        ScanOptions options; options.rootA = dir.path(); options.backend = Backend::Native; options.hashWorkers = 1; options.photosOnly = true;
+        const auto result = Scanner::scan(options, token());
+        QVERIFY(result.error.isEmpty()); QCOMPARE(result.groups.size(), 1); QCOMPARE(result.groups[0].files[0].name, QString("same.jpg"));
+        QCOMPARE(result.inspected, quint64(6)); QCOMPARE(result.sampled, quint64(6)); QCOMPARE(result.sampleRejected, quint64(2)); QCOMPARE(result.hashed, quint64(4));
+        QCOMPARE(result.hashBytes, quint64(800000)); QCOMPARE(result.groups[0].files[0].sha256, QCryptographicHash::hash(first, QCryptographicHash::Sha256));
+        options.sampling = false; const auto unfiltered = Scanner::scan(options, token());
+        QCOMPARE(unfiltered.hashed, quint64(6)); QCOMPARE(unfiltered.groups.size(), 1); QCOMPARE(unfiltered.groups[0].files[0].sha256, result.groups[0].files[0].sha256);
+    }
+    void dateDirectoryPolicyAndDefaultReset() {
+        QTemporaryDir dir(QDir::currentPath() + "/test-output/case-XXXXXX");
+        const auto date = createFile(dir.path(), "2022.1.1 元旦/photo.jpg", "same");
+        const auto normal = createFile(dir.path(), "相册/原始/照片/photo.jpg", "same");
+        createFile(dir.path(), "2023. 春节/photo.jpg", "same");
+        FileTreeModel model; model.setResult(scan(dir.path())); QCOMPARE(model.operationCount(), 2);
+        QCOMPARE(model.result().groups[0].files[model.result().groups[0].keeper].path, date);
+        model.applyRule({}, KeepRule::PreferNonDated); for (const auto &op : model.plan()) QCOMPARE(op.target.path, normal);
+        model.setReplacement({model.index(0, 0)}, false); QCOMPARE(model.operationCount(), 0); QCOMPARE(model.saving(), quint64(0));
+        model.resetDefaults(); QCOMPARE(model.operationCount(), 2); QCOMPARE(model.saving(), quint64(8));
+        for (const auto &op : model.plan()) QCOMPARE(op.target.path, date);
+        FileRecord f; f.root = dir.path();
+        for (const auto &name : {"2013. 清明", "2017.国庆示例", "2024.08.11 旅行", "2022-1-1 假期", "2022年1月1日 假期"}) { f.path = dir.path() + "/" + name + "/photo.jpg"; QVERIFY2(datedDescriptionFolder(f), name); }
+        for (const auto &name : {"2022.13.1 无效", "2022.2.30 无效", "2022.1.1", "00_相册", "相册2022.1.1 元旦"}) { f.path = dir.path() + "/" + name + "/photo.jpg"; QVERIFY2(!datedDescriptionFolder(f), name); }
+    }
+    void displayModesDoNotChangeThePlan() {
+        QTemporaryDir dir(QDir::currentPath() + "/test-output/case-XXXXXX");
+        createFile(dir.path(), "original.jpg", "same"); createFile(dir.path(), "copy/original.jpg", "same");
+        createFile(dir.path(), "unique/unique.jpg", "different"); QDir().mkpath(dir.path() + "/empty/child");
+        MainWindow window; window.viewModel()->model()->setResult(scan(dir.path()));
+        auto *pairs = window.findChild<ComparisonModel *>(); auto *display = window.findChild<QComboBox *>("displayMode");
+        auto *defaults = window.findChild<QPushButton *>("resetDefaults"); auto *permanent = window.findChild<QCheckBox *>("permanentDelete");
+        QVERIFY(pairs && display && defaults && permanent); QAbstractItemModelTester tester(pairs, QAbstractItemModelTester::FailureReportingMode::QtTest);
+        display->setCurrentIndex(0); QCOMPARE(pairs->rowCount(pairs->index(0, 0)), 0); QCOMPARE(window.viewModel()->model()->operationCount(), 1);
+        display->setCurrentIndex(1); QCOMPARE(pairs->rowCount(pairs->index(0, 0)), 3);
+        std::function<void(QModelIndex)> foldersOnly = [&](QModelIndex parent) { for (int r = 0; r < pairs->rowCount(parent); ++r) { const auto i = pairs->index(r, 0, parent); QVERIFY(i.data(FileTreeModel::FolderRole).toBool()); foldersOnly(i); } };
+        foldersOnly(pairs->index(0, 0)); QCOMPARE(window.viewModel()->model()->operationCount(), 1);
+        display->setCurrentIndex(2); QVERIFY(pairIndex(*pairs, dir.path() + "/copy/original.jpg").isValid());
+        auto *source = window.viewModel()->model();
+        QVERIFY(source->chooseSelected({source->indexForPath(dir.path() + "/copy/original.jpg")}).isEmpty());
+        const int selectedKeeper = source->result().groups[0].keeper;
+        const auto uniqueFolder = source->indexForPath(dir.path() + "/unique"); QVERIFY(uniqueFolder.isValid());
+        source->applyRule({uniqueFolder}, KeepRule::Shallowest); QCOMPARE(source->result().groups[0].keeper, selectedKeeper);
+        window.viewModel()->model()->setReplacement({window.viewModel()->model()->index(0, 0)}, false); QCOMPARE(window.viewModel()->model()->operationCount(), 0);
+        permanent->setChecked(true); defaults->click(); QVERIFY(!permanent->isChecked()); QCOMPARE(window.viewModel()->model()->operationCount(), 1);
+    }
+    void largeModelRefreshTouchesOnlyOneGroup() {
+        QTemporaryDir dir(QDir::currentPath() + "/test-output/case-XXXXXX"); ScanResult result;
+        result.options.rootA = cleanPath(dir.path()); QElapsedTimer timer; timer.start();
+        for (int g = 0; g < 20000; ++g) {
+            DuplicateGroup group;
+            for (int f = 0; f < 2; ++f) {
+                FileRecord file; file.root = result.options.rootA; file.name = QString("photo-%1.jpg").arg(g); file.side = "A";
+                file.path = file.root + (f ? "/copies/" : "/") + file.name; file.depth = f; file.size = 1024;
+                file.modified = QDateTime::currentDateTime(); file.sha256 = QByteArray(32, 'a'); group.files.append(file);
+            }
+            setKeeper(group, Mode::Single, 0); result.groups.append(group);
+        }
+        FileTreeModel model; ComparisonModel pairs(&model); timer.restart(); model.setResult(result);
+        const auto buildMs = timer.elapsed(); QCOMPARE(model.operationCount(), 20000); QCOMPARE(pairs.pairCount(), 20000);
+        QSignalSpy changed(&pairs, &QAbstractItemModel::dataChanged); QSignalSpy reset(&pairs, &QAbstractItemModel::modelReset);
+        const auto row = model.indexForFile(19999, 1); timer.restart(); QVERIFY(model.setData(row.sibling(row.row(), FileTreeModel::Replace), Qt::Unchecked, Qt::CheckStateRole));
+        QCOMPARE(changed.count(), 1); QCOMPARE(reset.count(), 0); QCOMPARE(model.operationCount(), 19999);
+        qInfo() << "20,000 pairs build ms:" << buildMs << "single checkbox ms:" << timer.elapsed();
+        ComparisonView view(&pairs); view.resize(1300, 600); view.show(); QCoreApplication::processEvents(); timer.restart();
+        for (int step = 0; step < 50; ++step) { view.candidateView()->verticalScrollBar()->setValue(step * view.candidateView()->verticalScrollBar()->maximum() / 49); QCoreApplication::processEvents(); }
+        qInfo() << "20,000 pairs / 50 scrolling updates ms:" << timer.elapsed();
     }
 };
 QTEST_MAIN(DupTests)

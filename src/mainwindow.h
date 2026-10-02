@@ -23,7 +23,7 @@ protected:
     void closeEvent(QCloseEvent *event) override;
 private:
     ViewModel vm;
-    QComboBox *mode, *backend, *rule, *sortKey, *sortDirection;
+    QComboBox *mode, *backend, *rule, *sortKey, *sortDirection, *displayMode;
     QLineEdit *pathA, *pathB;
     QTreeView *tree;
     ComparisonModel *comparison;

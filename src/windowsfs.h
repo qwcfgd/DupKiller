@@ -1,5 +1,6 @@
 #pragma once
 #include "domain.h"
+#include <QSet>
 #include <windows.h>
 #include <vector>
 
@@ -29,12 +30,23 @@ bool hashStreams(const QString &path, QMap<QString, QByteArray> &hashes, const C
                  std::vector<Handle> *guards = nullptr);
 bool copyStreams(const QString &source, const QString &destination, const QMap<QString, QByteArray> &expected,
                  const Cancel &cancel, QString &error);
-bool hashHandle(HANDLE h, QByteArray &hash, const Cancel &cancel, QString &error);
-bool hashFile(FileRecord &file, const Cancel &cancel, QString &error);
+using ReadProgress = std::function<void(quint64)>;
+bool hashHandle(HANDLE h, QByteArray &hash, const Cancel &cancel, QString &error, const ReadProgress &readProgress = {});
+bool hashFile(FileRecord &file, const Cancel &cancel, QString &error, const ReadProgress &readProgress = {});
+bool sampleFile(const FileRecord &file, QByteArray &sample, const Cancel &cancel, QString &error);
+int recommendedHashWorkers(const QString &root);
 bool renameHandle(HANDLE h, const QString &destination, QString &error);
 bool createShortcut(const QString &link, const QString &target, QString &error);
 QString shortcutTarget(const QString &link, QString &error);
-bool recycleFile(const QString &path, QString &recycledPath, QByteArray &itemId, FileRecord &binMetadata, QString &error);
+class RecycleSession {
+    QSet<QString> checkedVolumes;
+    int queries = 0;
+    friend bool recycleFile(const QString &, QString &, QByteArray &, FileRecord &, QString &, RecycleSession *);
+public:
+    int queryCount() const { return queries; }
+};
+bool recycleFile(const QString &path, QString &recycledPath, QByteArray &itemId, FileRecord &binMetadata, QString &error,
+                 RecycleSession *session = nullptr);
 bool restoreRecycled(const QByteArray &itemId, const QString &recycledPath, const QString &destination, QString &error);
 bool durableAppend(const QString &path, const QByteArray &line, QString &error);
 class ComScope {

@@ -11,7 +11,7 @@ public:
     ~ViewModel() override;
     FileTreeModel *model() { return &tree; }
     bool busy() const { return working; }
-    bool canExecute() const { return !working && !stale && !tree.plan().isEmpty(); }
+    bool canExecute() const { return !working && !stale && tree.operationCount() > 0; }
     void scan(ScanOptions options);
     void execute(bool permanent);
     void recover(const QString &journal);

@@ -63,7 +63,7 @@ bool removeOwnedLink(const QString &link, const FileRecord &identity, QString &e
     if (!SetFileInformationByHandle(h.value, FileDispositionInfo, &disposition, sizeof(disposition))) { error = win::errorText(); return false; }
     return true;
 }
-bool replaceOne(const Operation &op, bool permanent, const QString &log, const Cancel &cancel, QString &error) {
+bool replaceOne(const Operation &op, bool permanent, const QString &log, const Cancel &cancel, QString &error, win::RecycleSession &recycleSession) {
     std::vector<win::Handle> parents;
     if (!win::lockParents(op.source.path, parents, error) || !win::lockParents(op.target.path, parents, error)) return false;
     win::Handle target = openFile(op.target.path, false), source = openFile(op.source.path, true);
@@ -140,7 +140,7 @@ bool replaceOne(const Operation &op, bool permanent, const QString &log, const C
             if (error.isEmpty()) error = win::errorText();
         } else {
             QString recycledPath; QByteArray itemId; FileRecord binMetadata;
-            removed = win::recycleFile(staged, recycledPath, itemId, binMetadata, error);
+            removed = win::recycleFile(staged, recycledPath, itemId, binMetadata, error, &recycleSession);
             if (removed) {
                 entry["recycledPath"] = recycledPath; entry["recycledItemId"] = QString::fromLatin1(itemId.toBase64());
                 if (!binMetadata.path.isEmpty()) entry["recycleMetadata"] = jsonFile(binMetadata);
@@ -179,11 +179,12 @@ ExecutionResult Executor::execute(const QVector<Operation> &plan, ScanOptions op
     win::ComScope com;
     if (!com.valid() || !QDir().mkpath(logs)) { result.failed = plan.size(); result.messages.append(QStringLiteral("无法初始化 Shell 或创建日志目录。")); return result; }
     result.logPath = QDir(logs).filePath("operation-" + QDateTime::currentDateTimeUtc().toString("yyyyMMdd-HHmmss-zzz") + "-" + QUuid::createUuid().toString(QUuid::WithoutBraces) + ".jsonl");
+    win::RecycleSession recycleSession;
     for (int i = 0; i < plan.size(); ++i) {
         if (cancel && cancel->load()) { result.cancelled = true; break; }
         if (progress) progress(QStringLiteral("重新校验并替换：") + plan[i].source.name, quint64(i), quint64(plan.size()));
         error.clear();
-        if (replaceOne(plan[i], permanent, result.logPath, cancel, error)) {
+        if (replaceOne(plan[i], permanent, result.logPath, cancel, error, recycleSession)) {
             ++result.done; result.messages.append(QStringLiteral("成功：") + plan[i].source.path + " → " + plan[i].target.path);
             if (!error.isEmpty()) result.messages.append(error);
         } else {
@@ -191,6 +192,7 @@ ExecutionResult Executor::execute(const QVector<Operation> &plan, ScanOptions op
             ++result.failed; result.messages.append(QStringLiteral("跳过/失败：") + plan[i].source.path + "：" + error);
         }
     }
+    result.recycleQueries = recycleSession.queryCount();
     if (progress) progress(QStringLiteral("执行完成"), quint64(result.done + result.failed), quint64(plan.size()));
     return result;
 }
